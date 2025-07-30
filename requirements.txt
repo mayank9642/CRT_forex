@@ -1,0 +1,10 @@
+# filepath: c:\vs code projects\forex strategies\crt_trading_system\requirements.txt
+pandas>=1.5.0
+numpy>=1.22.0
+matplotlib>=3.5.0
+plotly>=5.10.0
+mplfinance>=0.12.9b0  # For financial charts
+seaborn>=0.12.0  # For enhanced visualizations
+python-dateutil>=2.8.2
+tqdm>=4.60.0  # For progress bars
+MetaTrader5>=5.0.34  # For MT5 integration
