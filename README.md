@@ -222,3 +222,11 @@ To generate and use test data:
 ```
 python main.py --test
 ```
+
+## Gold Symbol Auto-Detection
+
+The CRT bot now auto-detects the correct gold symbol (e.g., XAUUSDm, XAUUSD, GOLD, etc.) at startup. It will use the first available symbol from a list of common variants, or any symbol containing both 'XAU' and 'USD' in its name. This eliminates the need to manually set the symbol for most brokers.
+
+If no valid symbol is found, the bot will print a warning and use 'XAUUSDm' as a fallback. If you encounter symbol errors, please check your broker's Market Watch and ensure the gold symbol is visible and enabled.
+
+---

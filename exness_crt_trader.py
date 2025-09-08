@@ -6,11 +6,32 @@ import os
 import openpyxl
 import sys
 import os
+import threading
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from src.news_filter import is_news_blocking
+from src.news_filter import is_news_blocking, SESSION_NEWS_WINDOWS
 
 # --- CONFIG ---
-SYMBOL = 'XAUUSDm'
+# Auto-detect the correct XAUUSD symbol (e.g., XAUUSD, XAUUSDm, GOLD, etc.)
+def detect_gold_symbol():
+    candidates = [
+        'XAUUSDm', 'XAUUSD', 'GOLD', 'XAUUSD.', 'XAUUSDz', 'XAUUSDmicro', 'XAUUSDpro', 'XAUUSDc', 'XAUUSD.x', 'XAUUSD.a', 'XAUUSD.r', 'XAUUSD.s'
+    ]
+    for sym in candidates:
+        info = mt5.symbol_info(sym)
+        if info is not None:
+            print(f"Auto-detected gold symbol: {sym}")
+            return sym
+    # Fallback: try to find any symbol containing 'XAU' and 'USD'
+    all_symbols = mt5.symbols_get()
+    if all_symbols is not None:
+        for s in all_symbols:
+            if 'XAU' in s.name and 'USD' in s.name:
+                print(f"Auto-detected gold symbol (fallback): {s.name}")
+                return s.name
+    print("Could not auto-detect a valid XAUUSD symbol. Please check your broker's Market Watch.")
+    return 'XAUUSDm'  # Default/fallback
+
+SYMBOL = detect_gold_symbol()
 RISK_PER_TRADE = 0.01
 # Set session hours to match Exness Market Watch time (UTC+0)
 SESSION_HOURS = sorted(set([1, 5, 9, 13, 15, 18, 21] + list(range(7, 22))))  # Compare legacy and full London/NY sessions
@@ -151,7 +172,7 @@ last_trade_day = None
 # --- Excel Journal Setup ---
 JOURNAL_FILE = "trade_journal.xlsx"
 JOURNAL_HEADERS = [
-    "Ticket", "DateTime", "Symbol", "Direction", "EntryPrice", "SL", "TP", "LotSize", "RR1", "RR2", "Status", "ExitPrice", "Profit", "Comment"
+    "Ticket", "DateTime", "Symbol", "Direction", "EntryPrice", "SL", "TP", "LotSize", "RR1", "RR2", "Status", "ExitPrice", "Profit", "PnL%", "MaxProfit", "MaxLoss", "Comment"
 ]
 if not os.path.exists(JOURNAL_FILE):
     wb = openpyxl.Workbook()
@@ -160,11 +181,11 @@ if not os.path.exists(JOURNAL_FILE):
     wb.save(JOURNAL_FILE)
 
 # --- Helper: Log trade to Excel journal ---
-def log_trade(ticket, dt, symbol, direction, entry, sl, tp, lot, rr1, rr2, status, exit_price, profit, comment):
+def log_trade(ticket, dt, symbol, direction, entry, sl, tp, lot, rr1, rr2, status, exit_price, profit, pnl_pct, max_profit, max_loss, comment):
     wb = openpyxl.load_workbook(JOURNAL_FILE)
     ws = wb.active
     ws.append([
-        ticket, dt, symbol, direction, entry, sl, tp, lot, rr1, rr2, status, exit_price, profit, comment
+        ticket, dt, symbol, direction, entry, sl, tp, lot, rr1, rr2, status, exit_price, profit, pnl_pct, max_profit, max_loss, comment
     ])
     wb.save(JOURNAL_FILE)
 
@@ -262,6 +283,83 @@ def is_in_premium_discount_zone(candle, trend, h1_df):
         return candle['high'] > mid
     return False
 
+# --- Monitor trade exits and log to journal ---
+def monitor_trade_exits():
+    """Background thread: Monitor open positions and log exits to journal, including max profit/loss and intelligent profit lock exits."""
+    import openpyxl
+    import time
+    max_pnl_tracker = {}  # ticket: {max_profit, max_loss, profit_lock_triggered}
+    profit_lock_rr = 1.0  # Activate profit lock after 1R is reached
+    profit_lock_drawdown_pct = 0.4  # Exit if profit pulls back 40% from max
+    while True:
+        positions = mt5.positions_get(symbol=SYMBOL)
+        # Update max profit/loss for open positions
+        if positions:
+            for pos in positions:
+                ticket = pos.ticket
+                entry_price = pos.price_open
+                lot = pos.volume
+                direction = 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL'
+                sl = pos.sl
+                # Calculate 1R (risk per trade)
+                risk = abs(entry_price - sl) * lot * (mt5.symbol_info(SYMBOL).trade_contract_size if mt5.symbol_info(SYMBOL) else 100)
+                # Calculate current floating PnL
+                current_price = mt5.symbol_info_tick(SYMBOL).ask if direction == 'BUY' else mt5.symbol_info_tick(SYMBOL).bid
+                contract_size = mt5.symbol_info(SYMBOL).trade_contract_size if mt5.symbol_info(SYMBOL) else 100
+                floating_pnl = (current_price - entry_price) * lot * contract_size if direction == 'BUY' else (entry_price - current_price) * lot * contract_size
+                # Track max profit/loss
+                if ticket not in max_pnl_tracker:
+                    max_pnl_tracker[ticket] = {'max_profit': floating_pnl, 'max_loss': floating_pnl, 'profit_lock_triggered': False, 'max_pnl_seen': floating_pnl}
+                else:
+                    max_pnl_tracker[ticket]['max_profit'] = max(max_pnl_tracker[ticket]['max_profit'], floating_pnl)
+                    max_pnl_tracker[ticket]['max_loss'] = min(max_pnl_tracker[ticket]['max_loss'], floating_pnl)
+                    max_pnl_tracker[ticket]['max_pnl_seen'] = max(max_pnl_tracker[ticket]['max_pnl_seen'], floating_pnl)
+                # Intelligent profit lock exit
+                max_pnl = max_pnl_tracker[ticket]['max_pnl_seen']
+                if not max_pnl_tracker[ticket]['profit_lock_triggered'] and max_pnl >= profit_lock_rr * risk:
+                    max_pnl_tracker[ticket]['profit_lock_triggered'] = True
+                    log_msg = f"Profit lock activated for ticket {ticket}: max_pnl={max_pnl:.2f}, risk={risk:.2f}"
+                    print(log_msg)
+                if max_pnl_tracker[ticket]['profit_lock_triggered']:
+                    lock_level = max_pnl - profit_lock_drawdown_pct * (max_pnl - 0)
+                    if floating_pnl < lock_level:
+                        # Close the position to lock in profit
+                        close_result = mt5.Close(ticket)
+                        log_msg = f"Profit lock exit for ticket {ticket}: floating_pnl={floating_pnl:.2f}, lock_level={lock_level:.2f}"
+                        print(log_msg)
+                        # Log exit to journal (handled by normal exit logic below)
+        # Check for closed positions
+        all_tickets = set(max_pnl_tracker.keys())
+        open_tickets = set([p.ticket for p in positions]) if positions else set()
+        closed_tickets = all_tickets - open_tickets
+        for closed_ticket in closed_tickets:
+            try:
+                # Find last deal for this ticket
+                history = mt5.history_deals_get(datetime.now() - timedelta(days=5), datetime.now())
+                for deal in history or []:
+                    if deal.position_id == closed_ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                        exit_price = deal.price
+                        profit = deal.profit
+                        exit_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(deal.time))
+                        tracker = max_pnl_tracker[closed_ticket]
+                        entry_price = None
+                        lot = None
+                        direction = None
+                        for pos in positions or []:
+                            if pos.ticket == closed_ticket:
+                                entry_price = pos.price_open
+                                lot = pos.volume
+                                direction = 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL'
+                        if entry_price is None or lot is None or direction is None:
+                            continue
+                        contract_size = mt5.symbol_info(SYMBOL).trade_contract_size if mt5.symbol_info(SYMBOL) else 100
+                        pnl_pct = (profit / (entry_price * lot * contract_size)) * 100 if entry_price and lot else 0
+                        log_trade(closed_ticket, exit_time, SYMBOL, direction, entry_price, '', '', lot, '', '', 'CLOSED', exit_price, profit, pnl_pct, tracker['max_profit'], tracker['max_loss'], 'Closed by TP/SL/manual')
+                        del max_pnl_tracker[closed_ticket]
+            except Exception as e:
+                print(f"Error logging trade exit for ticket {closed_ticket}: {e}")
+        time.sleep(30)  # Check every 30 seconds
+
 # --- Main CRT Strategy Loop ---
 print("Starting advanced CRT strategy on live Exness demo...")
 last_trade_time = None
@@ -270,612 +368,708 @@ last_trade_time = None
 last_trade_day = None
 trades_today = 0
 
-while True:
-    broker_now = get_broker_time()
-    broker_day = broker_now.date()
-    symbol_details = get_symbol_details()
-    min_stop = symbol_details["adjusted_min_stop"] if symbol_details else 3.0
-    
-    # Daily trade tracking
-    if last_trade_day != broker_day:
-        trades_today = 0
-        last_trade_day = broker_day
-        print(f"\n{broker_now} New trading day started. Trade count reset to 0/3.")
-    
-    # Clear display of current trading status
-    print(f"\n{broker_now} === SEQUENTIAL TRADING STATUS ===")
-    print(f"Trade lock active: {TRADE_LOCK}")
-    print(f"Trades taken today: {trades_today}/3")
-    print(f"Current positions: {len(mt5.positions_get(symbol=SYMBOL) or [])}")
-    
-    if trades_today >= 3:
-        print(f"{broker_now} Max 3 trades reached for {broker_day}. Not taking any more trades today.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: Max 3 trades reached for the day\n")
-        time.sleep(60)
-        continue
-          # Check if any positions are currently open - only take a new trade if no positions are open
-    current_positions = mt5.positions_get(symbol=SYMBOL)
-    if current_positions and len(current_positions) > 0:
-        print(f"{broker_now} Positions already open. Waiting for them to close before taking a new trade.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: Waiting for open positions to close\n")
-              # Reset trade lock if positions are detected but lock is false
-        # This ensures proper sequential trading
-        if not TRADE_LOCK:
-            print(f"{broker_now} Detected open positions but trade lock was False. Resetting lock.")
-            TRADE_LOCK = True
-            
-        time.sleep(60)
-        continue
-    if broker_now.hour not in SESSION_HOURS:
-        print(f"{broker_now} Not in CRT session hours (Market Watch time). Waiting...")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: Not in CRT session hours\n")
-        time.sleep(60)
-        continue
-    if is_news_blocking():
-        print("Skipping trading due to high-impact news event.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: High-impact news event\n")
-        time.sleep(1800)
-        continue
-    # --- Trend context ---
-    trend = get_trend_direction()
-    if trend is None:
-        print(f"{broker_now} No trend detected. Skipping.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: No trend detected\n")
-        time.sleep(60)
-        continue
-    h1_df = get_rates(SYMBOL, RANGE_TIMEFRAME, 30, 1)
-    if h1_df is None:
-        print("No H1 data. Waiting...")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: No H1 data\n")
-        time.sleep(10)
-        continue
-    # --- CRT pattern detection ---
-    entry_found = False
-    crt_candle_idx = None
-    if STRICT_CRT_MODE:
-        # Strict: power-of-three pattern
-        range_candle = h1_df.iloc[0]
-        sweep_candle = h1_df.iloc[1]
-        confirm_candle = h1_df.iloc[2]
-        crt_high = range_candle['high']
-        crt_low = range_candle['low']
-        sweeped_high = sweep_candle['high'] > crt_high
-        sweeped_low = sweep_candle['low'] < crt_low
-        confirm_in_range = (crt_low < confirm_candle['close'] < crt_high)
-        if not ((sweeped_high or sweeped_low) and confirm_in_range):
-            print(f"{broker_now} No CRT power-of-three pattern.")
-            with open("crt_skip_log.txt", "a") as f:
-                f.write(f"{broker_now} SKIP: No CRT power-of-three pattern\n")
-            time.sleep(60)
-            continue
-        direction = 'SELL' if sweeped_high else 'BUY'
-        crt_candle_idx = 0
-        entry_found = True
-    else:
-        # Flexible: any sweep and close back inside range, trend-aware, premium/discount filter
-        for i in range(1, len(h1_df)):
-            prev = h1_df.iloc[i-1]
-            curr = h1_df.iloc[i]
-            crt_high = prev['high']
-            crt_low = prev['low']
-            # For uptrend, look for bearish candle sweep below low and close back in range
-            if trend == 'UP' and prev['close'] < prev['open']:
-                if curr['low'] < crt_low and crt_low < curr['close'] < crt_high:
-                    if is_in_premium_discount_zone(prev, trend, h1_df):
-                        direction = 'BUY'
-                        crt_candle_idx = i-1
-                        entry_found = True
-                        break
-            # For downtrend, look for bullish candle sweep above high and close back in range
-            if trend == 'DOWN' and prev['close'] > prev['open']:
-                if curr['high'] > crt_high and crt_low < curr['close'] < crt_high:
-                    if is_in_premium_discount_zone(prev, trend, h1_df):
-                        direction = 'SELL'
-                        crt_candle_idx = i-1
-                        entry_found = True
-                        break
-        if not entry_found:
-            print(f"{broker_now} No flexible CRT sweep/close-in-range pattern.")
-            with open("crt_skip_log.txt", "a") as f:
-                f.write(f"{broker_now} SKIP: No flexible CRT sweep/close-in-range pattern\n")
-            time.sleep(60)
-            continue
-    # --- Lower timeframe entry (FVG, refined: closest to sweep) ---
-    m5_df = get_rates(SYMBOL, ENTRY_TIMEFRAME, 20, 1)
-    if m5_df is None:
-        print("No M5 data. Waiting...")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: No M5 data\n")
-        time.sleep(10)
-        continue
-    entry_candle = None
-    fvg_candidates = []
-    sweep_time = None
-    if crt_candle_idx is not None:
-        sweep_time = h1_df.iloc[crt_candle_idx+1].name  # time of sweep candle
-    if direction == 'BUY':
-        # Look for all bullish FVGs (gap between previous high and current low) after the sweep
-        for i in range(1, len(m5_df)):
-            if m5_df.iloc[i]['low'] > m5_df.iloc[i-1]['high']:
-                if sweep_time is None or m5_df.index[i] >= sweep_time:
-                    fvg_candidates.append(m5_df.iloc[i])
-        if fvg_candidates:
-            # Pick the FVG closest in time to the sweep (first after sweep)
-            entry_candle = fvg_candidates[0]
-        else:
-            entry_candle = m5_df.iloc[-1]  # fallback: use last candle
-        price = mt5.symbol_info_tick(SYMBOL).ask
-    else:
-        # Look for all bearish FVGs (gap between previous low and current high) after the sweep
-        for i in range(1, len(m5_df)):
-            if m5_df.iloc[i]['high'] < m5_df.iloc[i-1]['low']:
-                if sweep_time is None or m5_df.index[i] >= sweep_time:
-                    fvg_candidates.append(m5_df.iloc[i])
-        if fvg_candidates:
-            # Pick the FVG closest in time to the sweep (first after sweep)
-            entry_candle = fvg_candidates[0]
-        else:
-            entry_candle = m5_df.iloc[-1]  # fallback: use last candle
-        price = mt5.symbol_info_tick(SYMBOL).bid
-    if entry_candle is None:
-        print(f"{broker_now} No CRT entry signal.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: No CRT entry signal\n")
-        time.sleep(60)
-        continue
-    # Prevent duplicate trades in same hour    if last_trade_time and entry_candle.name <= last_trade_time:
-        time.sleep(60)
-        continue
-    last_trade_time = entry_candle.name
-    
-    # --- SL/TP and R:R Calculation with ATR-based dynamic stops ---
-    symbol_info = mt5.symbol_info(SYMBOL)
-    if symbol_info is None:
-        print("Failed to get symbol info")
-        time.sleep(60)
-        continue
-    
-    # Get stop level in points and convert to price units
-    # Access properties via the _asdict() method which is the proper way to access named tuple attributes
-    symbol_dict = symbol_info._asdict()
-    
-    # Get the trade_stops_level from the dictionary
-    stops_level = symbol_dict.get('trade_stops_level', 0)
-    point = symbol_dict.get('point', 0.001)
-    digits = symbol_dict.get('digits', 3)
-    
-    print(f"Symbol info: trade_stops_level={stops_level}, point={point}, digits={digits}")
-    
-    # Calculate ATR for dynamic stop-loss based on market volatility
-    # For XAUUSDm, this will give appropriate stop distance based on current market conditions
-    atr_value = calculate_atr(SYMBOL, RANGE_TIMEFRAME, period=14)
-    if atr_value is None:
-        print("Failed to calculate ATR, using fixed buffer")
-        atr_value = SL_BUFFER
-    else:
-        print(f"ATR value for {SYMBOL} on {RANGE_TIMEFRAME} timeframe: {atr_value:.2f}")
-    
-    # For gold specifically, ensure minimum stop distance is adequate
-    # Gold is typically quoted with 2 decimal places (e.g., 1945.00)
-    if SYMBOL.startswith("XAU"):
-        # Use 1.2x ATR or minimum buffer, whichever is larger (reduced multiplier from 1.5x)
-        dynamic_sl_buffer = max(atr_value * 1.2, MIN_SL_DISTANCE)
-        # Use a fixed minimum SL distance for gold that we know works
-        min_stop_price = MIN_SL_DISTANCE
-    else:
-        dynamic_sl_buffer = max(atr_value * 1.2, SL_BUFFER)  # Reduced multiplier from 1.5x
-        min_stop_price = stops_level * point
-        if min_stop_price < 0.0001:
-            min_stop_price = MIN_SL_DISTANCE
-    
-    print(f"Symbol {SYMBOL} | Using dynamic SL buffer: {dynamic_sl_buffer:.2f} | Min stop in price: {min_stop_price:.2f}")
-    
-    if direction == 'BUY':
-        # Calculate preferred SL based on entry candle and ATR
-        preferred_sl = entry_candle['low'] - dynamic_sl_buffer
-        
-        # Enforce minimum broker stop distance
-        required_sl = price - min_stop_price
-        
-        # Use the lower (further from price) of the two values for safety
-        sl = min(preferred_sl, required_sl)
-        sl = round(sl, digits)
-          # Calculate take profits - more conservative to prevent frequent SL hits
-        # Use closer targets for higher profitability rate (0.65:1 and 1.3:1)
-        tp1 = round(price + (dynamic_sl_buffer * 0.65), digits)  # 0.65:1 R:R for first target (closer)
-        tp2 = round(price + (dynamic_sl_buffer * 1.3), digits)  # 1.3:1 R:R for second target (closer)
-        
-        # Calculate risk and reward
-        risk = abs(price - sl)
-        rr1 = abs(tp1 - price) / risk if risk > 0 else 0
-        rr2 = abs(tp2 - price) / risk if risk > 0 else 0
-    else:  # SELL
-        # Calculate preferred SL based on entry candle and ATR
-        preferred_sl = entry_candle['high'] + dynamic_sl_buffer
-        
-        # Enforce minimum broker stop distance
-        required_sl = price + min_stop_price
-        
-        # Use the higher (further from price) of the two values for safety
-        sl = max(preferred_sl, required_sl)
-        sl = round(sl, digits)
-          # Calculate take profits - more conservative to prevent frequent SL hits
-        tp1 = round(price - (dynamic_sl_buffer * 0.65), digits)  # 0.65:1 R:R for first target (closer)
-        tp2 = round(price - (dynamic_sl_buffer * 1.3), digits)  # 1.3:1 R:R for second target (closer)
-        
-        # Calculate risk and reward
-        risk = abs(price - sl)
-        rr1 = abs(price - tp1) / risk if risk > 0 else 0
-        rr2 = abs(price - tp2) / risk if risk > 0 else 0
-        
-    # Add detailed debugging to diagnose stop level issues
-    print(f"Order details: {direction} | price={price} | sl={sl} | preferred_sl={preferred_sl if direction=='BUY' else preferred_sl} | required_sl={required_sl if direction=='BUY' else required_sl}")
-    print(f"Order validation: SL distance={abs(price-sl):.2f} | Min required={min_stop_price:.2f} | Valid={abs(price-sl) >= min_stop_price}")
-      # Double-check SL validity before sending order
-    if direction == 'BUY' and price - sl < min_stop_price:
-        # Recalculate SL with a small safety buffer for gold
-        if SYMBOL.startswith("XAU"):
-            sl = price - 1.0  # $1.00 minimum SL distance for gold
-        else:
-            sl = price - (min_stop_price * 1.1)  # Add 10% safety margin
-        sl = round(sl, digits)
-        print(f"⚠️ Buy SL too close! Adjusted to: {sl}, distance: {price-sl:.2f}")
-    elif direction == 'SELL' and sl - price < min_stop_price:
-        # Recalculate SL with a small safety buffer for gold
-        if SYMBOL.startswith("XAU"):
-            sl = price + 1.0  # $1.00 minimum SL distance for gold
-        else:
-            sl = price + (min_stop_price * 1.1)  # Add 10% safety margin
-        sl = round(sl, digits)
-        print(f"⚠️ Sell SL too close! Adjusted to: {sl}, distance: {sl-price:.2f}")
-        
-    # Recalculate risk and R:R after any SL adjustments
-    risk = abs(price - sl)
-    if direction == 'BUY':
-        rr1 = abs(tp1 - price) / risk if risk > 0 else 0
-        rr2 = abs(tp2 - price) / risk if risk > 0 else 0
-    else:
-        rr1 = abs(price - tp1) / risk if risk > 0 else 0
-        rr2 = abs(price - tp2) / risk if risk > 0 else 0
-    # --- Dynamic lot size for 1% risk per trade ---    account = mt5.account_info()
-    balance = account.balance if account else 10000
-    
-    # Get symbol info and safely access trade_contract_size through dictionary
-    symbol_info_obj = mt5.symbol_info(SYMBOL)
-    if symbol_info_obj:
-        symbol_info_dict = symbol_info_obj._asdict()
-        contract_size = symbol_info_dict.get('trade_contract_size', 100)
-    else:
-        contract_size = 100
-    max_risk = balance * RISK_PER_TRADE
-    # For gold, pip value is usually $1 per lot per $1 move, but use contract_size for safety
-    lot_size = max_risk / (risk * contract_size) if risk > 0 else 0.01
-    lot_size = max(lot_size, 0.01)  # enforce broker minimum
-    half_lot = round(lot_size / 2, 2)
-    # Only trade if R:R to at least one TP is MIN_RR+
-    if max(rr1, rr2) < MIN_RR:
-        print(f"{broker_now} R:R too low (TP1: {rr1:.2f}, TP2: {rr2:.2f}). Skipping trade.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: R:R too low (TP1: {rr1:.2f}, TP2: {rr2:.2f})\n")
-        time.sleep(60)
-        continue    # Check if trade lock is active
-    if TRADE_LOCK:
-        print(f"{broker_now} Trading lock active. Skipping signal.")
-        with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: Trading lock active\n")
-        time.sleep(60)
-        continue
-          
-    # Activate the trade lock to prevent duplicate entries
-    TRADE_LOCK = True
-    
-    # Use the already calculated dynamic SL distance that considers ATR
-    # We've already calculated this in the previous section
-    min_stop_price = MIN_SL_DISTANCE
+# --- Prevent duplicate trades on restart by saving and checking the last trade signal (entry candle time) in a file ---
+import os
+LAST_SIGNAL_FILE = "crt_last_signal.txt"
 
-    print(f"Using minimum SL distance of {min_stop_price:.2f} for {SYMBOL}")
-    
-    # Get current exact price
-    current_tick = mt5.symbol_info_tick(SYMBOL)
-    if current_tick is None:
-        print("Failed to get current price tick")
-        TRADE_LOCK = False  # Release lock
-        time.sleep(10)
-        continue
-    
-    # Use the exact current price with zero slippage for more accurate SL calculation
-    if direction == 'BUY':
-        current_price = current_tick.ask
-        # Set SL at a safe distance - fixed value for gold
-        sl = current_price - min_stop_price
-        sl = round(sl, digits)
-        print(f"Setting BUY SL at {min_stop_price:.2f} distance: price={current_price}, sl={sl}")
-    else:  # SELL
-        current_price = current_tick.bid
-        # Set SL at a safe distance - fixed value for gold
-        sl = current_price + min_stop_price
-        sl = round(sl, digits)
-        print(f"Setting SELL SL at {min_stop_price:.2f} distance: price={current_price}, sl={sl}")
-    
-    # Place order (split into two positions for partial TP)
-    # First position: TP1 (mid-range)
-    request1 = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
-        "volume": half_lot,
-        "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
-        "price": current_price,  # Use exact current price instead of calculated price
-        "sl": sl,
-        "tp": tp1,
-        "deviation": 20,
-        "magic": 123456,
-        "comment": "CRT advanced TP1",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    # Second position: TP2 (full range)
-    request2 = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
-        "volume": half_lot,
-        "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
-        "price": current_price,  # Use exact current price instead of calculated price
-        "sl": sl,
-        "tp": tp2,
-        "deviation": 20,
-        "magic": 123457,
-        "comment": "CRT advanced TP2",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    # Calculate final risk-reward after all adjustments
-    risk = abs(current_price - sl)
-    if direction == 'BUY':
-        rr1 = abs(tp1 - current_price) / risk if risk > 0 else 0
-        rr2 = abs(tp2 - current_price) / risk if risk > 0 else 0
-    else:
-        rr1 = abs(current_price - tp1) / risk if risk > 0 else 0
-        rr2 = abs(current_price - tp2) / risk if risk > 0 else 0
-    
-    # Check R:R one last time
-    if max(rr1, rr2) < MIN_RR:
-        print(f"{broker_now} Final R:R too low after SL adjustments (TP1: {rr1:.2f}, TP2: {rr2:.2f}). Skipping trade.")
+# Load last signal date from file (ensure it's always defined)
+last_signal_date = None
+if os.path.exists(LAST_SIGNAL_FILE):
+    with open(LAST_SIGNAL_FILE, "r") as f:
+        last_signal_date = f.read().strip()
+
+# Example session-specific news windows (customize as needed)
+SESSION_NEWS_WINDOWS.update({
+    'London': 45,  # Block 45 min before/after news during London
+    'NY': 60,      # Block 60 min before/after news during NY
+})
+
+if __name__ == "__main__":
+    threading.Thread(target=monitor_trade_exits, daemon=True).start()
+    while True:
+        broker_now = get_broker_time()
+        broker_day = broker_now.date()
+        symbol_details = get_symbol_details()
+        min_stop = symbol_details["adjusted_min_stop"] if symbol_details else 3.0
+        
+        # Daily trade tracking
+        if last_trade_day != broker_day:
+            trades_today = 0
+            last_trade_day = broker_day
+            TRADE_LOCK = False  # Reset trade lock at the start of each new broker day
+            # Clear last signal file and in-memory variable to allow new trade for the new day
+            with open(LAST_SIGNAL_FILE, "w") as f:
+                f.write("")
+            last_signal_date = ""
+            print(f"\n{broker_now} New trading day started. Trade count reset to 0/3. Trade lock released. Duplicate signal reset.")
+        
+        # Clear display of current trading status
+        print(f"\n{broker_now} === SEQUENTIAL TRADING STATUS ===")
+        print(f"Trade lock active: {TRADE_LOCK}")
+        print(f"Trades taken today: {trades_today}/3")
+        print(f"Current positions: {len(mt5.positions_get(symbol=SYMBOL) or [])}")
+        
+        if trades_today >= 3:
+            print(f"{broker_now} Max 3 trades reached for {broker_day}. Not taking any more trades today.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Max 3 trades reached for the day\n")
+            time.sleep(60)
+            continue
+        # Check if any positions are currently open - only take a new trade if no positions are open
+        current_positions = mt5.positions_get(symbol=SYMBOL)
+        if current_positions and len(current_positions) > 0:
+            print(f"{broker_now} Positions already open. Waiting for them to close before taking a new trade.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Waiting for open positions to close\n")
+                # Reset trade lock if positions are detected but lock is false
+            # This ensures proper sequential trading
+            if not TRADE_LOCK:
+                print(f"{broker_now} Detected open positions but trade lock was False. Resetting lock.")
+                TRADE_LOCK = True
+                
+            time.sleep(60)
+            continue
+        if broker_now.hour not in SESSION_HOURS:
+            print(f"{broker_now} Not in CRT session hours (Market Watch time). Waiting...")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Not in CRT session hours\n")
+            time.sleep(60)
+            continue
+        # Determine session name (example logic, customize as needed)
+        session_name = 'Other'
+        if 7 <= broker_now.hour < 15:
+            session_name = 'London'
+        elif 15 <= broker_now.hour < 22:
+            session_name = 'NY'
+        # Use advanced news filter with session-specific window
+        if is_news_blocking(session_name=session_name):
+            print(f"Skipping trading due to high-impact news event (session: {session_name}).")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: High-impact news event (session: {session_name})\n")
+            time.sleep(1800)
+            continue
+        # --- Trend context ---
+        trend = get_trend_direction()
+        if trend is None:
+            print(f"{broker_now} No trend detected. Skipping.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: No trend detected\n")
+            time.sleep(60)
+            continue
+        h1_df = get_rates(SYMBOL, RANGE_TIMEFRAME, 30, 1)
+        if h1_df is None:
+            print("No H1 data. Waiting...")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: No H1 data\n")
+            time.sleep(10)
+            continue
+        # --- CRT pattern detection ---
+        entry_found = False
+        crt_candle_idx = None
+        if STRICT_CRT_MODE:
+            # Strict: power-of-three pattern
+            range_candle = h1_df.iloc[0]
+            sweep_candle = h1_df.iloc[1]
+            confirm_candle = h1_df.iloc[2]
+            crt_high = range_candle['high']
+            crt_low = range_candle['low']
+            # Log CRT range
+            log_msg = f"{broker_now} CRT Range (Strict): High={crt_high}, Low={crt_low}"
+            print(log_msg)
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(log_msg + "\n")
+            sweeped_high = sweep_candle['high'] > crt_high
+            sweeped_low = sweep_candle['low'] < crt_low
+            confirm_in_range = (crt_low < confirm_candle['close'] < crt_high)
+            # Log sweep detection
+            if sweeped_high or sweeped_low:
+                sweep_dir = 'HIGH' if sweeped_high else 'LOW'
+                sweep_price = sweep_candle['high'] if sweeped_high else sweep_candle['low']
+                log_msg = f"{broker_now} Sweep detected ({sweep_dir}) at {sweep_candle.name} price={sweep_price}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
+            if not ((sweeped_high or sweeped_low) and confirm_in_range):
+                print(f"{broker_now} No CRT power-of-three pattern.")
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(f"{broker_now} SKIP: No CRT power-of-three pattern\n")
+                time.sleep(60)
+                continue
+            direction = 'SELL' if sweeped_high else 'BUY'
+            crt_candle_idx = 0
+            entry_found = True
+        else:
+            # Flexible: any sweep and close back inside range, trend-aware, premium/discount filter
+            for i in range(1, len(h1_df)):
+                prev = h1_df.iloc[i-1]
+                curr = h1_df.iloc[i]
+                crt_high = prev['high']
+                crt_low = prev['low']
+                # Log CRT range
+                log_msg = f"{broker_now} CRT Range (Flexible): High={crt_high}, Low={crt_low}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
+                # For uptrend, look for bearish candle sweep below low and close back in range
+                if trend == 'UP' and prev['close'] < prev['open']:
+                    if curr['low'] < crt_low and crt_low < curr['close'] < crt_high:
+                        if is_in_premium_discount_zone(prev, trend, h1_df):
+                            log_msg = f"{broker_now} Sweep detected (LOW) at {curr.name} price={curr['low']} (UP trend)"
+                            print(log_msg)
+                            with open("crt_skip_log.txt", "a") as f:
+                                f.write(log_msg + "\n")
+                            direction = 'BUY'
+                            crt_candle_idx = i-1
+                            entry_found = True
+                            break
+                # For downtrend, look for bullish candle sweep above high and close back in range
+                if trend == 'DOWN' and prev['close'] > prev['open']:
+                    if curr['high'] > crt_high and crt_low < curr['close'] < crt_high:
+                        if is_in_premium_discount_zone(prev, trend, h1_df):
+                            log_msg = f"{broker_now} Sweep detected (HIGH) at {curr.name} price={curr['high']} (DOWN trend)"
+                            print(log_msg)
+                            with open("crt_skip_log.txt", "a") as f:
+                                f.write(log_msg + "\n")
+                            direction = 'SELL'
+                            crt_candle_idx = i-1
+                            entry_found = True
+                            break
+            if not entry_found:
+                print(f"{broker_now} No flexible CRT sweep/close-in-range pattern.")
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(f"{broker_now} SKIP: No flexible CRT sweep/close-in-range pattern\n")
+                time.sleep(60)
+                continue
+        # --- Lower timeframe entry (FVG, refined: closest to sweep) ---
+        m5_df = get_rates(SYMBOL, ENTRY_TIMEFRAME, 20, 1)
+        if m5_df is None:
+            print("No M5 data. Waiting...")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: No M5 data\n")
+            time.sleep(10)
+            continue
+        entry_candle = None
+        fvg_candidates = []
+        sweep_time = None
+        if crt_candle_idx is not None:
+            sweep_time = h1_df.iloc[crt_candle_idx+1].name  # time of sweep candle
+        log_msg = f"{broker_now} Switching to {ENTRY_TIMEFRAME} for FVG refinement after sweep at {sweep_time}"
+        print(log_msg)
         with open("crt_skip_log.txt", "a") as f:
-            f.write(f"{broker_now} SKIP: Final R:R too low after SL adjustments (TP1: {rr1:.2f}, TP2: {rr2:.2f})\n")
-        time.sleep(60)
-        continue
-    
-    # Send first order
-    print(f"Sending order 1: {direction} | Price: {current_price} | SL: {sl} | TP: {tp1} | SL Distance: {abs(current_price-sl):.2f}")
-    result1 = mt5.order_send(request1)
-    if result1 is None:
-        print("Error: Order 1 returned None")
-        time.sleep(60)
-        continue
-        
-    if result1.retcode == 10016:  # Invalid stops error
-        print(f"⚠️ INVALID STOPS ERROR for order 1:")
-        print(f"  Symbol: {SYMBOL}")
-        print(f"  Direction: {direction}")
-        print(f"  Price: {current_price}")
-        print(f"  SL: {sl} (distance: {abs(current_price-sl):.2f})")
-        print(f"  Min required: {min_stop_price:.2f}")
-        print(f"  Point value: {symbol_details['point'] if symbol_details else 'unknown'}")
-        print(f"  Stops level: {symbol_details['stops_level'] if symbol_details else 'unknown'}")
-        
-        # Exness sometimes requires larger stop-loss for XAUUSDm
-        # Instead of trying multiple values, immediately use a large enough value
-        if SYMBOL.startswith("XAU"):
-            # Use a fixed SL distance that we know works with Exness
-            safe_distance = MIN_SL_DISTANCE * 1.1  # 10% larger than our minimum (reduced from 20%)
-            
-            if direction == 'BUY':
-                new_sl = round(current_price - safe_distance, digits)
+            f.write(log_msg + "\n")
+        if direction == 'BUY':
+            # Look for all bullish FVGs (gap between previous high and current low) after the sweep
+            for i in range(1, len(m5_df)):
+                if m5_df.iloc[i]['low'] > m5_df.iloc[i-1]['high']:
+                    if sweep_time is None or m5_df.index[i] >= sweep_time:
+                        fvg_candidates.append(m5_df.iloc[i])
+            if fvg_candidates:
+                entry_candle = fvg_candidates[0]
+                log_msg = f"{broker_now} FVG selected for entry (BUY) at {entry_candle.name} price={entry_candle['low']}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
             else:
-                new_sl = round(current_price + safe_distance, digits)
-                
-            print(f"Using safe SL distance of {safe_distance:.2f} → SL: {new_sl}")
-            
-            # Update request with new SL
-            request1_retry = request1.copy()
-            request1_retry["sl"] = new_sl
-            retry_result1 = mt5.order_send(request1_retry)
-            
-            if retry_result1 and retry_result1.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"SUCCESS with safe SL distance!")
-                result1 = retry_result1  # Use the successful result
-                sl = new_sl  # Update SL for second order
+                entry_candle = m5_df.iloc[-1]  # fallback: use last candle
+                log_msg = f"{broker_now} No FVG found after sweep, fallback to last M5 candle at {entry_candle.name}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
+            price = mt5.symbol_info_tick(SYMBOL).ask
+        else:
+            # Look for all bearish FVGs (gap between previous low and current high) after the sweep
+            for i in range(1, len(m5_df)):
+                if m5_df.iloc[i]['high'] < m5_df.iloc[i-1]['low']:
+                    if sweep_time is None or m5_df.index[i] >= sweep_time:
+                        fvg_candidates.append(m5_df.iloc[i])
+            if fvg_candidates:
+                entry_candle = fvg_candidates[0]
+                log_msg = f"{broker_now} FVG selected for entry (SELL) at {entry_candle.name} price={entry_candle['high']}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
+            else:
+                entry_candle = m5_df.iloc[-1]  # fallback: use last candle
+                log_msg = f"{broker_now} No FVG found after sweep, fallback to last M5 candle at {entry_candle.name}"
+                print(log_msg)
+                with open("crt_skip_log.txt", "a") as f:
+                    f.write(log_msg + "\n")
+            price = mt5.symbol_info_tick(SYMBOL).bid
+        # --- After entry_candle is found and before trade logic ---
+        if entry_candle is None:
+            print(f"{broker_now} No CRT entry signal.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: No CRT entry signal\n")
+            time.sleep(60)
+            continue
+        # Prevent duplicate trades on same daily candle (across restarts)
+        entry_date = str(entry_candle.name)[:10]  # YYYY-MM-DD
+        today = str(broker_now.date())
+        if last_signal_date == today:
+            print(f"{broker_now} Duplicate CRT signal detected for {today}. Skipping trade.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Duplicate CRT signal detected for {today}\n")
+            time.sleep(60)
+            continue
+        # Save new signal date after trade is placed
+        last_trade_time = entry_candle.name
+        with open(LAST_SIGNAL_FILE, "w") as f:
+            f.write(today)
         
-        # If still failed, try alternative: first open without SL, then modify
-        if result1.retcode == 10016:
-            request1_no_sl = request1.copy()
-            request1_no_sl.pop('sl', None)
-            request1_no_sl.pop('tp', None)
-            print("Trying alternative method: Open position without SL/TP first")
-            alt_result1 = mt5.order_send(request1_no_sl)
-            
-            if alt_result1 and alt_result1.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"Position opened without SL/TP. Adding SL/TP...")
-                # Add SL/TP in a separate request
-                modify_request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": alt_result1.order,
-                    "symbol": SYMBOL,
-                    "sl": sl,
-                    "tp": tp1,
-                }
-                modify_result = mt5.order_send(modify_request)
-                if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"Successfully added SL/TP")
-                    result1 = alt_result1  # Consider it successful
-                else:
-                    print(f"Failed to add SL/TP: {modify_result.retcode} {modify_result.comment}")
-                    
-                    # Try again with a larger stop distance
-                    if SYMBOL.startswith("XAU"):
-                        larger_sl = current_price - 5.0 if direction == 'BUY' else current_price + 5.0
-                        larger_sl = round(larger_sl, digits)
-                        modify_request["sl"] = larger_sl
-                        print(f"Trying with much larger SL: {larger_sl}")
-                        modify_result = mt5.order_send(modify_request)
-                        if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-                            print(f"Successfully added SL/TP with larger distance")
-                            result1 = alt_result1  # Consider it successful
-    
-    # If first order succeeded, try the second
-    if result1.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"{entry_candle.name} {direction} TP1 order placed at {current_price} | SL: {sl} | TP: {tp1} | RR1: {rr1:.2f}")
-        log_trade(result1.order, str(broker_now), SYMBOL, direction, current_price, sl, tp1, half_lot, rr1, rr2, "OPEN", "", "", request1['comment'])
+        # --- SL/TP and R:R Calculation with ATR-based dynamic stops ---
+        symbol_info = mt5.symbol_info(SYMBOL)
+        if symbol_info is None:
+            print("Failed to get symbol info")
+            time.sleep(60)
+            continue
         
-        # Send second order
-        print(f"Sending order 2: {direction} | Price: {current_price} | SL: {sl} | TP: {tp2} | SL Distance: {abs(current_price-sl):.2f}")
-        result2 = mt5.order_send(request2)
+        # Get stop level in points and convert to price units
+        # Access properties via the _asdict() method which is the proper way to access named tuple attributes
+        symbol_dict = symbol_info._asdict()
         
-        if result2 and result2.retcode == 10016:  # Invalid stops error for second order
-            print(f"⚠️ INVALID STOPS ERROR for order 2:")
+        # Get the trade_stops_level from the dictionary
+        stops_level = symbol_dict.get('trade_stops_level', 0)
+        point = symbol_dict.get('point', 0.001)
+        digits = symbol_dict.get('digits', 3)
+        
+        print(f"Symbol info: trade_stops_level={stops_level}, point={point}, digits={digits}")
+        
+        # Calculate ATR for dynamic stop-loss based on market volatility
+        # For XAUUSDm, this will give appropriate stop distance based on current market conditions
+        atr_value = calculate_atr(SYMBOL, RANGE_TIMEFRAME, period=14)
+        if atr_value is None:
+            print("Failed to calculate ATR, using fixed buffer")
+            atr_value = SL_BUFFER
+        else:
+            print(f"ATR value for {SYMBOL} on {RANGE_TIMEFRAME} timeframe: {atr_value:.2f}")
+        
+        # For gold specifically, ensure minimum stop distance is adequate
+        # Gold is typically quoted with 2 decimal places (e.g., 1945.00)
+        if SYMBOL.startswith("XAU"):
+            # Use 1.2x ATR or minimum buffer, whichever is larger (reduced multiplier from 1.5x)
+            dynamic_sl_buffer = max(atr_value * 1.2, MIN_SL_DISTANCE)
+            # Use a fixed minimum SL distance for gold that we know works
+            min_stop_price = MIN_SL_DISTANCE
+        else:
+            dynamic_sl_buffer = max(atr_value * 1.2, SL_BUFFER)  # Reduced multiplier from 1.5x
+            min_stop_price = stops_level * point
+            if min_stop_price < 0.0001:
+                min_stop_price = MIN_SL_DISTANCE
+        
+        print(f"Symbol {SYMBOL} | Using dynamic SL buffer: {dynamic_sl_buffer:.2f} | Min stop in price: {min_stop_price:.2f}")
+        
+        if direction == 'BUY':
+            # Calculate preferred SL based on entry candle and ATR
+            preferred_sl = entry_candle['low'] - dynamic_sl_buffer
             
-            # For XAUUSDm, use the same safe SL distance that worked for order 1
+            # Enforce minimum broker stop distance
+            required_sl = price - min_stop_price
+            
+            # Use the lower (further from price) of the two values for safety
+            sl = min(preferred_sl, required_sl)
+            sl = round(sl, digits)
+            # Calculate take profits - more conservative to prevent frequent SL hits
+            # Use closer targets for higher profitability rate (0.65:1 and 1.3:1)
+            tp1 = round(price + (dynamic_sl_buffer * 0.65), digits)  # 0.65:1 R:R for first target (closer)
+            tp2 = round(price + (dynamic_sl_buffer * 1.3), digits)  # 1.3:1 R:R for second target (closer)
+            
+            # Calculate risk and reward
+            risk = abs(price - sl)
+            rr1 = abs(tp1 - price) / risk if risk > 0 else 0
+            rr2 = abs(tp2 - price) / risk if risk > 0 else 0
+        else:  # SELL
+            # Calculate preferred SL based on entry candle and ATR
+            preferred_sl = entry_candle['high'] + dynamic_sl_buffer
+            
+            # Enforce minimum broker stop distance
+            required_sl = price + min_stop_price
+            
+            # Use the higher (further from price) of the two values for safety
+            sl = max(preferred_sl, required_sl)
+            sl = round(sl, digits)
+            # Calculate take profits - more conservative to prevent frequent SL hits
+            tp1 = round(price - (dynamic_sl_buffer * 0.65), digits)  # 0.65:1 R:R for first target (closer)
+            tp2 = round(price - (dynamic_sl_buffer * 1.3), digits)  # 1.3:1 R:R for second target (closer)
+            
+            # Calculate risk and reward
+            risk = abs(price - sl)
+            rr1 = abs(price - tp1) / risk if risk > 0 else 0
+            rr2 = abs(price - tp2) / risk if risk > 0 else 0
+            
+        # Add detailed debugging to diagnose stop level issues
+        print(f"Order details: {direction} | price={price} | sl={sl} | preferred_sl={preferred_sl if direction=='BUY' else preferred_sl} | required_sl={required_sl if direction=='BUY' else required_sl}")
+        print(f"Order validation: SL distance={abs(price-sl):.2f} | Min required={min_stop_price:.2f} | Valid={abs(price-sl) >= min_stop_price}")
+        # Double-check SL validity before sending order
+        if direction == 'BUY' and price - sl < min_stop_price:
+            # Recalculate SL with a small safety buffer for gold
             if SYMBOL.startswith("XAU"):
-                # Use the same safe SL value that worked for order 1
-                print(f"Using same safe SL for order 2: {sl}")
-                
-                # Update request with new SL (which should now be the successful SL from order 1)
-                request2_retry = request2.copy()
-                retry_result2 = mt5.order_send(request2_retry)
-                
-                if retry_result2 and retry_result2.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"SUCCESS with safe SL for order 2!")
-                    result2 = retry_result2  # Use the successful result
+                sl = price - 1.0  # $1.00 minimum SL distance for gold
+            else:
+                sl = price - (min_stop_price * 1.1)  # Add 10% safety margin
+            sl = round(sl, digits)
+            print(f"⚠️ Buy SL too close! Adjusted to: {sl}, distance: {price-sl:.2f}")
+        elif direction == 'SELL' and sl - price < min_stop_price:
+            # Recalculate SL with a small safety buffer for gold
+            if SYMBOL.startswith("XAU"):
+                sl = price + 1.0  # $1.00 minimum SL distance for gold
+            else:
+                sl = price + (min_stop_price * 1.1)  # Add 10% safety margin
+            sl = round(sl, digits)
+            print(f"⚠️ Sell SL too close! Adjusted to: {sl}, distance: {sl-price:.2f}")
             
-            # If still failed, try alternative for second order
-            if result2.retcode == 10016:
-                request2_no_sl = request2.copy()
-                request2_no_sl.pop('sl', None)
-                request2_no_sl.pop('tp', None)
-                print("Trying alternative method for order 2: Open position without SL/TP first")
-                alt_result2 = mt5.order_send(request2_no_sl)
+        # Recalculate risk and R:R after any SL adjustments
+        risk = abs(price - sl)
+        if direction == 'BUY':
+            rr1 = abs(tp1 - price) / risk if risk > 0 else 0
+            rr2 = abs(tp2 - price) / risk if risk > 0 else 0
+        else:
+            rr1 = abs(price - tp1) / risk if risk > 0 else 0
+            rr2 = abs(price - tp2) / risk if risk > 0 else 0
+        # --- Dynamic lot size for 1% risk per trade ---    account = mt5.account_info()
+        balance = account.balance if account else 10000
+        
+        # Get symbol info and safely access trade_contract_size through dictionary
+        symbol_info_obj = mt5.symbol_info(SYMBOL)
+        if symbol_info_obj:
+            symbol_info_dict = symbol_info_obj._asdict()
+            contract_size = symbol_info_dict.get('trade_contract_size', 100)
+        else:
+            contract_size = 100
+        max_risk = balance * RISK_PER_TRADE
+        # For gold, pip value is usually $1 per lot per $1 move, but use contract_size for safety
+        lot_size = max_risk / (risk * contract_size) if risk > 0 else 0.01
+        lot_size = max(lot_size, 0.01)  # enforce broker minimum
+        half_lot = round(lot_size / 2, 2)
+        # Only trade if R:R to at least one TP is MIN_RR+
+        if max(rr1, rr2) < MIN_RR:
+            print(f"{broker_now} R:R too low (TP1: {rr1:.2f}, TP2: {rr2:.2f}). Skipping trade.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: R:R too low (TP1: {rr1:.2f}, TP2: {rr2:.2f})\n")
+            time.sleep(60)
+            continue    # Check if trade lock is active
+        if TRADE_LOCK:
+            print(f"{broker_now} Trading lock active. Skipping signal.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Trading lock active\n")
+            time.sleep(60)
+            continue
+            
+        # Activate the trade lock to prevent duplicate entries
+        TRADE_LOCK = True
+        
+        # Use the already calculated dynamic SL distance that considers ATR
+        # We've already calculated this in the previous section
+        min_stop_price = MIN_SL_DISTANCE
+
+        print(f"Using minimum SL distance of {min_stop_price:.2f} for {SYMBOL}")
+        
+        # Get current exact price
+        current_tick = mt5.symbol_info_tick(SYMBOL)
+        if current_tick is None:
+            print("Failed to get current price tick")
+            TRADE_LOCK = False  # Release lock
+            time.sleep(10)
+            continue
+        
+        # Use the exact current price with zero slippage for more accurate SL calculation
+        if direction == 'BUY':
+            current_price = current_tick.ask
+            # Set SL at a safe distance - fixed value for gold
+            sl = current_price - min_stop_price
+            sl = round(sl, digits)
+            print(f"Setting BUY SL at {min_stop_price:.2f} distance: price={current_price}, sl={sl}")
+        else:  # SELL
+            current_price = current_tick.bid
+            # Set SL at a safe distance - fixed value for gold
+            sl = current_price + min_stop_price
+            sl = round(sl, digits)
+            print(f"Setting SELL SL at {min_stop_price:.2f} distance: price={current_price}, sl={sl}")
+        
+        # Place order (split into two positions for partial TP)
+        # First position: TP1 (mid-range)
+        request1 = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": half_lot,
+            "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
+            "price": current_price,  # Use exact current price instead of calculated price
+            "sl": sl,
+            "tp": tp1,
+            "deviation": 20,
+            "magic": 123456,
+            "comment": "CRT advanced TP1",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        # Second position: TP2 (full range)
+        request2 = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": half_lot,
+            "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
+            "price": current_price,  # Use exact current price instead of calculated price
+            "sl": sl,
+            "tp": tp2,
+            "deviation": 20,
+            "magic": 123457,
+            "comment": "CRT advanced TP2",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        # Calculate final risk-reward after all adjustments
+        risk = abs(current_price - sl)
+        if direction == 'BUY':
+            rr1 = abs(tp1 - current_price) / risk if risk > 0 else 0
+            rr2 = abs(tp2 - current_price) / risk if risk > 0 else 0
+        else:
+            rr1 = abs(current_price - tp1) / risk if risk > 0 else 0
+            rr2 = abs(current_price - tp2) / risk if risk > 0 else 0
+        
+        # Check R:R one last time
+        if max(rr1, rr2) < MIN_RR:
+            print(f"{broker_now} Final R:R too low after SL adjustments (TP1: {rr1:.2f}, TP2: {rr2:.2f}). Skipping trade.")
+            with open("crt_skip_log.txt", "a") as f:
+                f.write(f"{broker_now} SKIP: Final R:R too low after SL adjustments (TP1: {rr1:.2f}, TP2: {rr2:.2f})\n")
+            time.sleep(60)
+            continue
+        
+        # Send first order
+        print(f"Sending order 1: {direction} | Price: {current_price} | SL: {sl} | TP: {tp1} | SL Distance: {abs(current_price-sl):.2f}")
+        result1 = mt5.order_send(request1)
+        if result1 is None:
+            print("Error: Order 1 returned None")
+            time.sleep(60)
+            continue
+            
+        if result1.retcode == 10016:  # Invalid stops error
+            print(f"⚠️ INVALID STOPS ERROR for order 1:")
+            print(f"  Symbol: {SYMBOL}")
+            print(f"  Direction: {direction}")
+            print(f"  Price: {current_price}")
+            print(f"  SL: {sl} (distance: {abs(current_price-sl):.2f})")
+            print(f"  Min required: {min_stop_price:.2f}")
+            print(f"  Point value: {symbol_details['point'] if symbol_details else 'unknown'}")
+            print(f"  Stops level: {symbol_details['stops_level'] if symbol_details else 'unknown'}")
+            
+            # Exness sometimes requires larger stop-loss for XAUUSDm
+            # Instead of trying multiple values, immediately use a large enough value
+            if SYMBOL.startswith("XAU"):
+                # Use a fixed SL distance that we know works with Exness
+                safe_distance = MIN_SL_DISTANCE * 1.1  # 10% larger than our minimum (reduced from 20%)
                 
-                if alt_result2 and alt_result2.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"Position 2 opened without SL/TP. Adding SL/TP...")
+                if direction == 'BUY':
+                    new_sl = round(current_price - safe_distance, digits)
+                else:
+                    new_sl = round(current_price + safe_distance, digits)
+                    
+                print(f"Using safe SL distance of {safe_distance:.2f} → SL: {new_sl}")
+                
+                # Update request with new SL
+                request1_retry = request1.copy()
+                request1_retry["sl"] = new_sl
+                retry_result1 = mt5.order_send(request1_retry)
+                
+                if retry_result1 and retry_result1.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"SUCCESS with safe SL distance!")
+                    result1 = retry_result1  # Use the successful result
+                    sl = new_sl  # Update SL for second order
+            
+            # If still failed, try alternative: first open without SL, then modify
+            if result1.retcode == 10016:
+                request1_no_sl = request1.copy()
+                request1_no_sl.pop('sl', None)
+                request1_no_sl.pop('tp', None)
+                print("Trying alternative method: Open position without SL/TP first")
+                alt_result1 = mt5.order_send(request1_no_sl)
+                
+                if alt_result1 and alt_result1.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"Position opened without SL/TP. Adding SL/TP...")
                     # Add SL/TP in a separate request
                     modify_request = {
                         "action": mt5.TRADE_ACTION_SLTP,
-                        "position": alt_result2.order,
+                        "position": alt_result1.order,
                         "symbol": SYMBOL,
                         "sl": sl,
-                        "tp": tp2,
+                        "tp": tp1,
                     }
                     modify_result = mt5.order_send(modify_request)
                     if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-                        print(f"Successfully added SL/TP to position 2")
-                        result2 = alt_result2  # Consider it successful
+                        print(f"Successfully added SL/TP")
+                        result1 = alt_result1  # Consider it successful
                     else:
-                        print(f"Failed to add SL/TP to position 2: {modify_result.retcode} {modify_result.comment}")
-                        
+                        print(f"Failed to add SL/TP: {modify_result.retcode} {modify_result.comment}")
                         # Try again with a larger stop distance
                         if SYMBOL.startswith("XAU"):
                             larger_sl = current_price - 5.0 if direction == 'BUY' else current_price + 5.0
                             larger_sl = round(larger_sl, digits)
-                            modify_request["sl"] = larger_sl
-                            print(f"Trying position 2 with much larger SL: {larger_sl}")
+                            print(f"Trying with much larger SL: {larger_sl}")
                             modify_result = mt5.order_send(modify_request)
                             if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-                                print(f"Successfully added SL/TP to position 2 with larger distance")
-                                result2 = alt_result2  # Consider it successful
+                                print(f"Successfully added SL/TP with larger distance")
+                                result1 = alt_result1  # Consider it successful
         
-        if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"{entry_candle.name} {direction} TP2 order placed at {current_price} | SL: {sl} | TP: {tp2} | RR2: {rr2:.2f}")
-            log_trade(result2.order, str(broker_now), SYMBOL, direction, current_price, sl, tp2, half_lot, rr1, rr2, "OPEN", "", "", request2['comment'])
-            trades_today += 1
+        # If first order succeeded, try the second
+        if result1.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"{entry_candle.name} {direction} TP1 order placed at {current_price} | SL: {sl} | TP: {tp1} | RR1: {rr1:.2f}")
+            log_trade(result1.order, str(broker_now), SYMBOL, direction, current_price, sl, tp1, half_lot, rr1, rr2, "OPEN", "", "", "", "", "", request1['comment'])
             
-            # Trade successfully placed - set cooldown time
-            print(f"Setting trade cooldown for {COOLDOWN_MINUTES} minutes")
-            time.sleep(60)  # Wait a minute before releasing lock to ensure no duplicate trades
-              # Create a background thread to release the trade lock after cooldown
+            # Send second order
+            print(f"Sending order 2: {direction} | Price: {current_price} | SL: {sl} | TP: {tp2} | SL Distance: {abs(current_price-sl):.2f}")
+            result2 = mt5.order_send(request2)
+            
+            if result2 and result2.retcode == 10016:  # Invalid stops error for second order
+                print(f"⚠️ INVALID STOPS ERROR for order 2:")
+                
+                # For XAUUSDm, use the same safe SL distance that worked for order 1
+                if SYMBOL.startswith("XAU"):
+                    # Use the same safe SL value that worked for order 1
+                    print(f"Using same safe SL for order 2: {sl}")
+                    
+                    # Update request with new SL (which should now be the successful SL from order 1)
+                    request2_retry = request2.copy()
+                    retry_result2 = mt5.order_send(request2_retry)
+                    
+                    if retry_result2 and retry_result2.retcode == mt5.TRADE_RETCODE_DONE:
+                        print(f"SUCCESS with safe SL for order 2!")
+                        result2 = retry_result2  # Use the successful result
+                
+                # If still failed, try alternative for second order
+                if result2.retcode == 10016:
+                    request2_no_sl = request2.copy()
+                    request2_no_sl.pop('sl', None)
+                    request2_no_sl.pop('tp', None)
+                    print("Trying alternative method for order 2: Open position without SL/TP first")
+                    alt_result2 = mt5.order_send(request2_no_sl)
+                    
+                    if alt_result2 and alt_result2.retcode == mt5.TRADE_RETCODE_DONE:
+                        print(f"Position 2 opened without SL/TP. Adding SL/TP...")
+                        # Add SL/TP in a separate request
+                        modify_request = {
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "position": alt_result2.order,
+                            "symbol": SYMBOL,
+                            "sl": sl,
+                            "tp": tp2,
+                        }
+                        modify_result = mt5.order_send(modify_request)
+                        if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
+                            print(f"Successfully added SL/TP to position 2")
+                            result2 = alt_result2  # Consider it successful
+                        else:
+                            print(f"Failed to add SL/TP to position 2: {modify_result.retcode} {modify_result.comment}")
+                            
+                            # Try again with a larger stop distance
+                            if SYMBOL.startswith("XAU"):
+                                larger_sl = current_price - 5.0 if direction == 'BUY' else current_price + 5.0
+                                larger_sl = round(larger_sl, digits)
+                                modify_request["sl"] = larger_sl
+                                print(f"Trying position 2 with much larger SL: {larger_sl}")
+                                modify_result = mt5.order_send(modify_request)
+                                if modify_result.retcode == mt5.TRADE_RETCODE_DONE:
+                                    print(f"Successfully added SL/TP to position 2 with larger distance")
+                                    result2 = alt_result2  # Consider it successful
+            
+            if result2 and result2.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"{entry_candle.name} {direction} TP2 order placed at {current_price} | SL: {sl} | TP: {tp2} | RR2: {rr2:.2f}")
+                log_trade(result2.order, str(broker_now), SYMBOL, direction, current_price, sl, tp2, half_lot, rr1, rr2, "OPEN", "", "", "", "", "", request2['comment'])
+                trades_today += 1
+                
+                # Trade successfully placed - set cooldown time
+                print(f"Setting trade cooldown for {COOLDOWN_MINUTES} minutes")
+                time.sleep(60)  # Wait a minute before releasing lock to ensure no duplicate trades
+                # Create a background thread to release the trade lock after cooldown
+                from threading import Thread
+                
+                def release_lock_after_cooldown():
+                    global TRADE_LOCK
+                    time.sleep(COOLDOWN_MINUTES * 60)
+                    TRADE_LOCK = False
+                    print(f"Trade lock released after {COOLDOWN_MINUTES} min cooldown")
+                    
+                Thread(target=release_lock_after_cooldown, daemon=True).start()
+            else:
+                print(f"Order 2 failed: {result2.retcode if result2 else 'None'} {result2.comment if result2 else 'No result'}")
+                TRADE_LOCK = False  # Release lock on failure
+        else:
+            print(f"Order 1 failed: {result1.retcode if result1 else 'None'} {result1.comment if result1 else 'No result'}")
+            TRADE_LOCK = False  # Release lock on failure
+            
+        # Monitor for TP1 hit to move SL to breakeven for TP2
+        if result1 and result2 and result1.retcode == mt5.TRADE_RETCODE_DONE and result2.retcode == mt5.TRADE_RETCODE_DONE:
+            print("Both orders placed successfully. Will monitor for TP1 hit to move TP2 to breakeven...")        # Create a background thread to monitor without blocking the main loop
             from threading import Thread
             
-            def release_lock_after_cooldown():
-                global TRADE_LOCK
-                time.sleep(COOLDOWN_MINUTES * 60)
-                TRADE_LOCK = False
-                print(f"Trade lock released after {COOLDOWN_MINUTES} min cooldown")
-                
-            Thread(target=release_lock_after_cooldown, daemon=True).start()
-        else:
-            print(f"Order 2 failed: {result2.retcode if result2 else 'None'} {result2.comment if result2 else 'No result'}")
-            TRADE_LOCK = False  # Release lock on failure
-    else:
-        print(f"Order 1 failed: {result1.retcode if result1 else 'None'} {result1.comment if result1 else 'No result'}")
-        TRADE_LOCK = False  # Release lock on failure
-        
-# Monitor for TP1 hit to move SL to breakeven for TP2
-    if result1 and result2 and result1.retcode == mt5.TRADE_RETCODE_DONE and result2.retcode == mt5.TRADE_RETCODE_DONE:
-        print("Both orders placed successfully. Will monitor for TP1 hit to move TP2 to breakeven...")        # Create a background thread to monitor without blocking the main loop
-        from threading import Thread
-        
-        def monitor_tp1():
-            max_checks = 720  # 2 hours max (10 seconds * 720 = 7200 seconds = 2 hours)
-            checks = 0
-            tp1_hit = False
-            entry_price = current_price  # Use the actual entry price
-            trade_completed = False
-            
-            while not tp1_hit and checks < max_checks:
-                time.sleep(10)
-                checks += 1
-                
-                # Check if TP1 position still exists
-                try:
-                    pos = mt5.positions_get(ticket=result1.order)
-                    if not pos:
-                        # TP1 closed - either hit TP or was manually closed
-                        tp1_hit = True
-                        
-                        # Get TP2 position to verify it still exists
-                        pos2 = mt5.positions_get(ticket=result2.order)
-                        if pos2:
-                            # Move SL to breakeven for TP2
-                            # Add small buffer (0.1 point) to ensure we're actually in profit
-                            if direction == 'BUY':
-                                be_level = entry_price + (point * 0.1)
-                            else:
-                                be_level = entry_price - (point * 0.1)
-                                  # Round to appropriate decimals
-                            be_level = round(be_level, digits)
-                            move_sl_to_breakeven(result2.order, be_level)
-                            print(f"{datetime.now()} Moved SL to breakeven ({be_level}) for TP2 position {result2.order}")
-                            # Log the breakeven move
-                            with open("crt_skip_log.txt", "a") as f:
-                                f.write(f"{datetime.now()} INFO: Moved TP2 position {result2.order} SL to breakeven ({be_level})\n")
-                        else:
-                            print("TP2 position no longer exists - both positions closed")
-                            # Release trade lock so new trades can be taken
-                            TRADE_LOCK = False
-                            print(f"{datetime.now()} Trade lock released - both positions closed")
-                            
-                            # Set trade_completed flag to True
-                            trade_completed = True
-                            print(f"{datetime.now()} Trade completed successfully")
-                except Exception as e:
-                    print(f"Error monitoring TP1: {e}")
-                    # Continue monitoring despite error
-        
-        # Start monitoring thread
-        monitor_thread = Thread(target=monitor_tp1, daemon=True)
-        monitor_thread.start()
-        
-        # Increment trades today count
-        trades_today += 1
-        print(f"{datetime.now()} Started trade {trades_today}/3 for today")
-    else:
-        time.sleep(60)
+            def monitor_tp1():
+                max_checks = 720  # 2 hours max (10 seconds * 720 = 7200 seconds = 2 hours)
+                checks = 0
+                tp1_hit = False
+                entry_price = current_price  # Use the actual entry price
+                trade_completed = False
+                trailing_activated = False
+                trailing_distance = abs(tp2 - entry_price) * 0.5  # Trailing SL at 50% of TP2 distance
+                last_trailing_sl = None
 
-mt5.shutdown()
+                while not tp1_hit and checks < max_checks:
+                    time.sleep(10)
+                    checks += 1
+                    try:
+                        pos = mt5.positions_get(ticket=result1.order)
+                        if not pos:
+                            tp1_hit = True
+                            pos2 = mt5.positions_get(ticket=result2.order)
+                            if pos2:
+                                # Move SL to breakeven for TP2
+                                if direction == 'BUY':
+                                    be_level = entry_price + (point * 0.1)
+                                else:
+                                    be_level = entry_price - (point * 0.1)
+                                be_level = round(be_level, digits)
+                                move_sl_to_breakeven(result2.order, be_level)
+                                print(f"{datetime.now()} Moved SL to breakeven ({be_level}) for TP2 position {result2.order}")
+                                with open("crt_skip_log.txt", "a") as f:
+                                    f.write(f"{datetime.now()} INFO: Moved TP2 position {result2.order} SL to breakeven ({be_level})\n")
+                                trailing_activated = True
+                                last_trailing_sl = be_level
+                            else:
+                                print("TP2 position no longer exists - both positions closed")
+                                TRADE_LOCK = False
+                                print(f"{datetime.now()} Trade lock released - both positions closed")
+                                trade_completed = True
+                                print(f"{datetime.now()} Trade completed successfully")
+                        # Trailing stop logic for TP2
+                        if trailing_activated:
+                            pos2 = mt5.positions_get(ticket=result2.order)
+                            if pos2:
+                                current_tp2_price = pos2[0].price_open if hasattr(pos2[0], 'price_open') else entry_price
+                                current_market_price = mt5.symbol_info_tick(SYMBOL).ask if direction == 'BUY' else mt5.symbol_info_tick(SYMBOL).bid
+                                if direction == 'BUY':
+                                    new_trailing_sl = max(last_trailing_sl, current_market_price - trailing_distance)
+                                else:
+                                    new_trailing_sl = min(last_trailing_sl, current_market_price + trailing_distance)
+                                new_trailing_sl = round(new_trailing_sl, digits)
+                                # Only move SL if it locks in more profit
+                                if (direction == 'BUY' and new_trailing_sl > last_trailing_sl) or (direction == 'SELL' and new_trailing_sl < last_trailing_sl):
+                                    move_sl_to_breakeven(result2.order, new_trailing_sl)
+                                    print(f"{datetime.now()} Trailing SL moved to {new_trailing_sl} for TP2 position {result2.order}")
+                                    with open("crt_skip_log.txt", "a") as f:
+                                        f.write(f"{datetime.now()} INFO: Trailing SL moved to {new_trailing_sl} for TP2 position {result2.order}\n")
+                                    last_trailing_sl = new_trailing_sl
+                            else:
+                                trailing_activated = False
+                    except Exception as e:
+                        print(f"Error monitoring TP1/trailing SL: {e}")
+                        # Continue monitoring despite error
+            
+            # Start monitoring thread
+            monitor_thread = Thread(target=monitor_tp1, daemon=True)
+            monitor_thread.start()
+            
+            # Increment trades today count
+            trades_today += 1
+            print(f"{datetime.now()} Started trade {trades_today}/3 for today")
+        else:
+            time.sleep(60)
+
+    mt5.shutdown()

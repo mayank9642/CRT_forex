@@ -56,6 +56,11 @@ We've also made several significant improvements to the CRT trading system in ea
 - Added more detailed logging for better trade analysis
 - Used threading for background monitoring without blocking the main loop
 
+## 6. Symbol Auto-Detection
+- The CRT bot now auto-detects the correct gold symbol (XAUUSD, XAUUSDm, GOLD, etc.) at startup, improving compatibility with different Exness and other broker accounts.
+- If no known symbol is found, it will search for any symbol containing both 'XAU' and 'USD'.
+- If still not found, it falls back to 'XAUUSDm' and prints a warning.
+
 ## Testing Recommendations
 1. Monitor the first few trades closely to ensure stop-loss distances are appropriate
 2. Verify the system doesn't place multiple trades for the same signal

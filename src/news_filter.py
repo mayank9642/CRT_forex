@@ -13,8 +13,11 @@ HIGH_IMPACT_KEYWORDS = [
 # Countries relevant for XAUUSD (Gold)
 RELEVANT_COUNTRIES = ["United States", "China", "Euro Area", "Japan", "United Kingdom"]
 
-# Minutes before/after news to block trading
-NEWS_WINDOW_MINUTES = 30
+# Minutes before/after news to block trading (can be set per session)
+NEWS_WINDOW_MINUTES = 30  # Default, can be overridden
+SESSION_NEWS_WINDOWS = {
+    # Example: 'London': 45, 'NY': 60
+}
 
 def get_upcoming_high_impact_news():
     now = datetime.utcnow()
@@ -44,7 +47,15 @@ def get_upcoming_high_impact_news():
                     high_impact_events.append(event)
     return high_impact_events
 
-def is_news_blocking():
+def is_news_blocking(session_name=None):
+    """
+    Returns True if there is high-impact news within the window for the current or given session.
+    """
+    global NEWS_WINDOW_MINUTES
+    window = NEWS_WINDOW_MINUTES
+    if session_name and session_name in SESSION_NEWS_WINDOWS:
+        window = SESSION_NEWS_WINDOWS[session_name]
+    NEWS_WINDOW_MINUTES = window
     events = get_upcoming_high_impact_news()
     if events:
         print("High-impact news detected:")
